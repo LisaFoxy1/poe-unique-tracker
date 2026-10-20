@@ -7,6 +7,9 @@ use sqlx::{sqlite::SqliteConnectOptions, Connection, SqliteConnection};
 use std::time::Duration;
 
 #[cfg(desktop)]
+use tauri::Emitter;
+
+#[cfg(desktop)]
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
@@ -164,6 +167,42 @@ async fn execute_sqlite_transaction(
     Ok(())
 }
 
+#[tauri::command]
+fn write_tracker_backup(
+    directory: String,
+    file_name: String,
+    bytes: Vec<u8>,
+) -> Result<String, String> {
+    use std::io::Write;
+
+    let folder = std::path::PathBuf::from(directory);
+    if !folder.is_absolute() || !folder.is_dir() {
+        return Err("Choose an existing absolute backup folder.".to_string());
+    }
+    if file_name.is_empty()
+        || !file_name.ends_with(".xlsx")
+        || file_name.contains('/')
+        || file_name.contains('\\')
+    {
+        return Err("The backup filename is invalid.".to_string());
+    }
+
+    let path = folder.join(file_name);
+    // Never silently overwrite an earlier backup.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| format!("Could not create backup: {}", error))?;
+
+    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(format!("Could not finish backup: {}", error));
+    }
+
+    Ok(path.to_string_lossy().to_string())
+}
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder =
@@ -250,7 +289,7 @@ pub fn run() {
 
     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
         api.prevent_close();
-        let _ = window.hide();
+        let _ = window.emit("main-close-requested", ());
     }
 })
 .plugin(tauri_plugin_clipboard_manager::init())
@@ -262,7 +301,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             send_ctrl_c,
             get_foreground_process_name,
-            execute_sqlite_transaction
+            execute_sqlite_transaction,
+            write_tracker_backup
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

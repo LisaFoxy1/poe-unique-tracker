@@ -37,6 +37,14 @@ import {
 } from "./poeItemParser";
 import ImportReviewModal from "./ImportReviewModal";
 import AppUpdater from "./AppUpdater";
+import { getVersion } from "@tauri-apps/api/app";
+import {
+  chooseTrackerSnapshot,
+  createTrackerBackup,
+  exportTrackerSnapshot,
+  restoreTrackerSnapshot,
+  type TrackerSnapshotPreview,
+} from "./trackerSnapshot";
 import "./App.css";
 
 type TrackingFlag =
@@ -132,6 +140,7 @@ type LeagueRolloverChange = {
 };
 
 type LeagueRolloverPreview = {
+  profileId: string;
   oldLeagueName: string;
   newLeagueName: string;
   changedUniques: number;
@@ -149,6 +158,8 @@ type SqliteTransactionStatement = {
   sql: string;
   params?: string[];
 };
+
+type BackupMode = "automatic" | "ask" | "off";
 
 type ImportMode = "status-list" | "missing-only";
 
@@ -1016,15 +1027,31 @@ async function fetchWikiVariantLabels(
   return labels;
 }
 
-async function fetchCurrentChallengeLeague(): Promise<
-  PoeTradeLeagueEntry | null
-> {
+// A league profile is identified by GGG's league ID, not by its position
+// in the trade endpoint response. The order may change between requests.
+function isExcludedPoE1League(id: string) {
+  const normalized = id
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+
+  return (
+    normalized === "standard" ||
+    normalized === "hardcore" ||
+    normalized === "ruthless" ||
+    normalized === "hardcore ruthless" ||
+    /^(hc|hardcore)\b/.test(normalized) ||
+    /\b(ssf|ruthless)\b/.test(normalized)
+  );
+}
+
+async function fetchActivePoE1Leagues(): Promise<PoeTradeLeagueEntry[]> {
   const response = await fetch(
     "https://www.pathofexile.com/api/trade/data/leagues",
     {
       headers: {
         Accept: "application/json",
-        "User-Agent": "PoE-Collector/0.1.0",
+        "User-Agent": "PoE-Collector/1.1.1",
       },
     },
   );
@@ -1035,48 +1062,24 @@ async function fetchCurrentChallengeLeague(): Promise<
     );
   }
 
-  const data =
-    (await response.json()) as PoeTradeLeagueResponse;
+  const data = (await response.json()) as PoeTradeLeagueResponse;
+  const seen = new Set<string>();
+
+  const leagues = data.result.filter((league) => {
+    if (isExcludedPoE1League(league.id) || seen.has(league.id)) {
+      return false;
+    }
+
+    seen.add(league.id);
+    return true;
+  });
 
   console.log(
-    "PoE trade leagues:",
-    data.result.map((league) => league.id),
+    "Detected active PoE leagues:",
+    leagues.map((league) => league.id),
   );
 
-  const candidates =
-    data.result.filter((league) => {
-      const id =
-        league.id.toLowerCase();
-
-      if (
-        id === "standard" ||
-        id === "hardcore" ||
-        id === "ruthless" ||
-        id === "hardcore ruthless"
-      ) {
-        return false;
-      }
-
-      if (
-        id.includes("hardcore") ||
-        id.includes("ruthless") ||
-        id.includes("ssf")
-      ) {
-        return false;
-      }
-
-      return true;
-    });
-
-  const detectedLeague =
-    candidates[0] ?? null;
-
-  console.log(
-    "Detected challenge league:",
-    detectedLeague?.id ?? "none",
-  );
-
-  return detectedLeague;
+  return leagues;
 }
 
 async function initializeCollectionProfiles(
@@ -1574,7 +1577,14 @@ const DEV_LEAGUE_ROLLOVER_HOTKEY =
 
 const OVERLAY_LABEL = "poe-overlay";
 const OVERLAY_WIDTH = 430;
-const OVERLAY_HEIGHT = 300;
+const OVERLAY_HEIGHT = 330;
+
+type OverlayProfileState = {
+  id: string;
+  name: string;
+  flags: TrackingFlag[];
+  reviewed: boolean;
+};
 
 type OverlayPayload = {
   trackingProfileId: string;
@@ -1585,8 +1595,7 @@ type OverlayPayload = {
   itemType: string;
   variantLabel: string | null;
   edition: "normal" | "foulborn" | "vestigial";
-  standardFlags: TrackingFlag[];
-  standardReviewed: boolean;
+  profileStates: OverlayProfileState[];
   trackingFlags: TrackingFlag[];
   trackingReviewed: boolean;
   editionAvailability: EditionAvailabilityMap;
@@ -1609,6 +1618,10 @@ type OverlayAction =
       kind: "missing";
       profileId: string;
       uniqueId: string;
+    }
+  | {
+      kind: "profile";
+      profileId: string;
     };
 
 function getOverlayPayloadFromUrl(): OverlayPayload | null {
@@ -1666,93 +1679,83 @@ useEffect(() => {
   const currentWindow =
     WebviewWindow.getCurrent();
 
-  let focusCheckTimer:
-  | number
-  | undefined;
+  let focusCheckTimer: number | undefined;
+  let snippingGraceUntil = 0;
+  let focusTransitionUntil = 0;
+  let destroyed = false;
 
-const resolveFocusChange =
-  async () => {
+  const scheduleFocusCheck = (delay: number) => {
+    if (destroyed) return;
+    if (focusCheckTimer !== undefined) {
+      window.clearTimeout(focusCheckTimer);
+    }
+    focusCheckTimer = window.setTimeout(() => {
+      focusCheckTimer = undefined;
+      void resolveFocusChange();
+    }, delay);
+  };
+
+  const resolveFocusChange = async () => {
+    if (destroyed) return;
     try {
-      const mainWindow =
-        await WebviewWindow.getByLabel(
-          "main",
-        );
-
-      if (
-        mainWindow &&
-        await mainWindow.isFocused()
-      ) {
-        const itemName =
-          lastMatchedNameRef.current;
-
-        if (itemName) {
-          await emit<string>(
-            "poe-overlay-search-item",
-            itemName,
-          );
+      const mainWindow = await WebviewWindow.getByLabel("main");
+      if (mainWindow && await mainWindow.isFocused()) {
+        if (Date.now() < focusTransitionUntil) {
+          scheduleFocusCheck(100);
+          return;
         }
 
+        const itemName = lastMatchedNameRef.current;
+        if (itemName) {
+          await emit<string>("poe-overlay-search-item", itemName);
+        }
         await currentWindow.hide();
         return;
       }
 
-      const foregroundProcess =
-        await invoke<string>(
-          "get_foreground_process_name",
-        );
-
-      const normalizedProcess =
-        foregroundProcess.toLowerCase();
-
-      const isSnippingTool =
-        normalizedProcess ===
-          "snippingtool.exe" ||
-        normalizedProcess ===
-          "screenclippinghost.exe";
+      const foregroundProcess = await invoke<string>(
+        "get_foreground_process_name",
+      );
+      const process = foregroundProcess.toLowerCase();
+      const isPathOfExile = process.includes("pathofexile");
+      const isSnippingTool = process === "snippingtool.exe" ||
+        process === "screenclippinghost.exe";
+      const isWindowsFocusTransition = process === "" ||
+        process === "explorer.exe" ||
+        process === "applicationframehost.exe" ||
+        process === "shellexperiencehost.exe";
 
       if (isSnippingTool) {
-        focusCheckTimer =
-          window.setTimeout(
-            () => {
-              void resolveFocusChange();
-            },
-            250,
-          );
+        snippingGraceUntil = Date.now() + 20000;
+        scheduleFocusCheck(250);
+        return;
+      }
 
+      if (snippingGraceUntil > Date.now() && !isPathOfExile) {
+        scheduleFocusCheck(250);
+        return;
+      }
+
+      if (isWindowsFocusTransition && Date.now() < focusTransitionUntil) {
+        scheduleFocusCheck(100);
         return;
       }
 
       await currentWindow.hide();
     } catch (error) {
-      console.error(
-        "Could not resolve overlay focus change:",
-        error,
-      );
-
-      void currentWindow.hide();
+      console.error("Could not resolve overlay focus change:", error);
+      if (!destroyed) void currentWindow.hide();
     }
   };
 
-const handleBlur = () => {
-  if (suppressNextBlurRef.current) {
-    suppressNextBlurRef.current = false;
-    return;
-  }
-
-  if (focusCheckTimer !== undefined) {
-    window.clearTimeout(
-      focusCheckTimer,
-    );
-  }
-
-  focusCheckTimer =
-    window.setTimeout(
-      () => {
-        void resolveFocusChange();
-      },
-      150,
-    );
-};
+  const handleBlur = () => {
+    if (suppressNextBlurRef.current) {
+      suppressNextBlurRef.current = false;
+      return;
+    }
+    focusTransitionUntil = Date.now() + 900;
+    scheduleFocusCheck(150);
+  };
 
   let unlistenLoading:
     | (() => void)
@@ -1805,6 +1808,7 @@ const handleBlur = () => {
   });
 
   return () => {
+    destroyed = true;
     window.removeEventListener(
       "blur",
       handleBlur,
@@ -1855,53 +1859,34 @@ if (!payload) {
   );
 }
 
-  const standardIsMissing =
-    payload.standardReviewed &&
-    !payload.standardFlags.some(
-      (flag) => payload.collectionRules[flag],
-    );
+  const trackingIsMissing = payload.trackingReviewed &&
+    !payload.trackingFlags.some((flag) => payload.collectionRules[flag]);
 
-  const trackingIsMissing =
-    payload.trackingReviewed &&
-    !payload.trackingFlags.some(
-      (flag) => payload.collectionRules[flag],
-    );
+  const editionLabel = payload.edition === "foulborn"
+    ? "FOULBORN"
+    : payload.edition === "vestigial"
+      ? "VESTIGIAL"
+      : null;
 
-  const editionLabel =
-    payload.edition === "foulborn"
-      ? "FOULBORN"
-      : payload.edition === "vestigial"
-        ? "VESTIGIAL"
-        : null;
+  const wornProfiles = payload.profileStates.filter(
+    (profile) => profile.flags.includes("wearing"),
+  );
+  const ownedProfiles = payload.profileStates.filter(
+    (profile) => profile.flags.length > 0 &&
+      !profile.flags.includes("wearing"),
+  );
 
-  const editionFlag =
-    payload.edition === "foulborn"
-      ? "foulborn"
-      : payload.edition === "vestigial"
-        ? "vestigial"
-        : null;
-
-  const standardOwnsQueriedEdition =
-    editionFlag === null
-      ? !standardIsMissing
-      : payload.standardFlags.includes(editionFlag);
-
-  const statusHeading =
-    editionLabel
-      ? `STANDARD • ${editionLabel} EDITION`
-      : "STANDARD COLLECTION";
-
-  const statusValue =
-    !payload.standardReviewed
-      ? "UNREVIEWED"
-      : standardOwnsQueriedEdition
-        ? "OWNED"
-        : "MISSING";
-
-  const trackingHeading =
-    payload.trackingProfileId === STANDARD_PROFILE_ID
-      ? "Update Standard"
-      : `Record in ${payload.trackingProfileName}`;
+  const statusHeading = "COLLECTION STATUS";
+  const statusValue = wornProfiles.length === 0 && ownedProfiles.length === 0
+    ? "Unowned"
+    : [
+        wornProfiles.length > 0
+          ? `Currently worn in ${wornProfiles.map((p) => p.name).join(", ")}`
+          : null,
+        ownedProfiles.length > 0
+          ? `Owned in ${ownedProfiles.map((p) => p.name).join(", ")}`
+          : null,
+      ].filter((part): part is string => part !== null).join(" • ");
 
       const showFoil =
   shouldShowEdition(
@@ -1965,88 +1950,76 @@ const hasUncertainEdition =
   foulbornUncertain ||
   vestigialUncertain;
 
-  async function toggleFlag(flag: TrackingFlag) {
-    if (!payload) {
-      return;
-    }
+  async function changeTrackingProfile(profileId: string) {
+    if (!payload) return;
+    const selected = payload.profileStates.find((profile) => profile.id === profileId);
+    if (!selected) return;
 
+    setPayload((current) => current ? {
+      ...current,
+      trackingProfileId: selected.id,
+      trackingProfileName: selected.name,
+      trackingFlags: [...selected.flags],
+      trackingReviewed: selected.reviewed,
+    } : current);
+
+    await emit<OverlayAction>("poe-overlay-action", {
+      kind: "profile",
+      profileId,
+    });
+  }
+
+  async function toggleFlag(flag: TrackingFlag) {
+    if (!payload) return;
     const enabled = !payload.trackingFlags.includes(flag);
+    const enabledFlags: TrackingFlag[] =
+      enabled && flag !== "owned" ? ["owned", flag] : [flag];
 
     setPayload((current) => {
-      if (!current) {
-        return current;
-      }
+      if (!current) return current;
+      const nextTrackingFlags = enabled
+        ? Array.from(new Set([...current.trackingFlags, ...enabledFlags]))
+        : current.trackingFlags.filter((existing) => existing !== flag);
 
       return {
         ...current,
+        trackingFlags: nextTrackingFlags,
         trackingReviewed: true,
-        trackingFlags: enabled
-          ? current.trackingFlags.includes(flag)
-            ? current.trackingFlags
-            : [...current.trackingFlags, flag]
-          : current.trackingFlags.filter(
-              (existingFlag) => existingFlag !== flag,
-            ),
-        standardReviewed:
-          current.trackingProfileId === STANDARD_PROFILE_ID
-            ? true
-            : current.standardReviewed,
-        standardFlags:
-          current.trackingProfileId === STANDARD_PROFILE_ID
-            ? enabled
-              ? current.standardFlags.includes(flag)
-                ? current.standardFlags
-                : [...current.standardFlags, flag]
-              : current.standardFlags.filter(
-                  (existingFlag) => existingFlag !== flag,
-                )
-            : current.standardFlags,
+        profileStates: current.profileStates.map((profile) =>
+          profile.id === current.trackingProfileId
+            ? { ...profile, flags: nextTrackingFlags, reviewed: true }
+            : profile,
+        ),
       };
     });
 
-    await emit<OverlayAction>(
-      "poe-overlay-action",
-      {
-        kind: "toggle",
-        profileId: payload.trackingProfileId,
-        uniqueId: payload.uniqueId,
-        flag,
-        enabled,
-      },
-    );
+    await emit<OverlayAction>("poe-overlay-action", {
+      kind: "toggle",
+      profileId: payload.trackingProfileId,
+      uniqueId: payload.uniqueId,
+      flag,
+      enabled,
+    });
   }
 
   async function markMissing() {
-    if (!payload) {
-      return;
-    }
+    if (!payload) return;
+    setPayload((current) => current ? {
+      ...current,
+      trackingFlags: [],
+      trackingReviewed: true,
+      profileStates: current.profileStates.map((profile) =>
+        profile.id === current.trackingProfileId
+          ? { ...profile, flags: [], reviewed: true }
+          : profile,
+      ),
+    } : current);
 
-    setPayload((current) =>
-      current
-        ? {
-            ...current,
-            trackingReviewed: true,
-            trackingFlags: [],
-            standardReviewed:
-              current.trackingProfileId === STANDARD_PROFILE_ID
-                ? true
-                : current.standardReviewed,
-            standardFlags:
-              current.trackingProfileId === STANDARD_PROFILE_ID
-                ? []
-                : current.standardFlags,
-          }
-        : current,
-    );
-
-    await emit<OverlayAction>(
-      "poe-overlay-action",
-      {
-        kind: "missing",
-        profileId: payload.trackingProfileId,
-        uniqueId: payload.uniqueId,
-      },
-    );
+    await emit<OverlayAction>("poe-overlay-action", {
+      kind: "missing",
+      profileId: payload.trackingProfileId,
+      uniqueId: payload.uniqueId,
+    });
   }
 
   return (
@@ -2094,7 +2067,7 @@ const hasUncertainEdition =
           </span>
         )}
 
-        {!payload.standardReviewed && (
+        {!payload.trackingReviewed && (
           <span className="poe-overlay-unreviewed">
             UNREVIEWED
           </span>
@@ -2107,7 +2080,18 @@ const hasUncertainEdition =
       </div>
 
       <div className="poe-overlay-tracking-heading">
-        {trackingHeading}
+        <span>Record in</span>
+        <select
+          className="poe-overlay-profile-select"
+          value={payload.trackingProfileId}
+          onChange={(event) => void changeTrackingProfile(event.target.value)}
+        >
+          {payload.profileStates.map((profile) => (
+            <option key={profile.id} value={profile.id}>
+              {profile.name}
+            </option>
+          ))}
+        </select>
       </div>
 
       <div className="poe-overlay-actions">
@@ -2432,6 +2416,42 @@ function MainApp() {
   const [sortMode, setSortMode] = useState<SortMode>("alphabetical");
 
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [closePromptOpen, setClosePromptOpen] = useState(false);
+
+  const [snapshotBusy, setSnapshotBusy] = useState(false);
+  const [snapshotMessage, setSnapshotMessage] = useState("");
+  const [snapshotRestoreError, setSnapshotRestoreError] = useState("");
+  const [pendingSnapshotRestore, setPendingSnapshotRestore] =
+    useState<TrackerSnapshotPreview | null>(null);
+  const [backupMode, setBackupMode] = useState<BackupMode>("automatic");
+  const [backupFolder, setBackupFolder] = useState("");
+  const [backupPromptOpen, setBackupPromptOpen] = useState(false);
+  const [backupSettingsMessage, setBackupSettingsMessage] = useState("");
+  const [appVersion, setAppVersion] = useState("");
+
+  useEffect(() => {
+    void getVersion().then(setAppVersion).catch((error) => {
+      console.warn("Could not read tracker version:", error);
+    });
+  }, []);
+
+  useEffect(() => {
+    let unlistenClose: (() => void) | undefined;
+
+    void listen<void>("main-close-requested", () => {
+      setClosePromptOpen(true);
+    })
+      .then((unlisten) => {
+        unlistenClose = unlisten;
+      })
+      .catch((error) => {
+        console.error("Could not listen for close requests:", error);
+      });
+
+    return () => {
+      unlistenClose?.();
+    };
+  }, []);
   const [statusColors, setStatusColors] =
     useState<StatusColors>(DEFAULT_STATUS_COLORS);
   const [collectionRules, setCollectionRules] =
@@ -2529,655 +2549,436 @@ const [
     [collectionProfiles, activeProfileId],
   );
 
-  async function initializeLiveLeague(
-  db: Database,
-  profiles: CollectionProfile[],
-) {
-  try {
-    const detectedLeague =
-      await fetchCurrentChallengeLeague();
-
-    if (!detectedLeague) {
-      console.warn(
-        "No active PoE challenge league was detected.",
+  async function initializeLiveLeagues(
+    db: Database,
+    profiles: CollectionProfile[],
+  ): Promise<CollectionProfile[]> {
+    try {
+      const detectedLeagues = await fetchActivePoE1Leagues();
+      // Ignore an empty response rather than assuming every league ended.
+      if (detectedLeagues.length === 0) {
+        return profiles;
+      }
+      const activeLeagueKeys = new Set(
+        detectedLeagues.map((league) => league.id),
       );
 
-      return profiles;
-    }
-
-    const currentLeagueRows =
-      await db.select<
-        {
+      const existing = await db.select<
+        Array<{
+          id: string;
           name: string;
           league_key: string | null;
-        }[]
-      >(
-        `
-          SELECT name, league_key
-          FROM collection_profiles
-          WHERE id = ?
-        `,
-        [CURRENT_LEAGUE_PROFILE_ID],
+          sort_order: number;
+        }>
+      >(`
+        SELECT id, name, league_key, sort_order
+        FROM collection_profiles
+        WHERE kind = 'challenge' AND is_archived = 0
+        ORDER BY sort_order ASC, created_at ASC
+      `);
+
+      let nextProfiles = [...profiles];
+      const representedLeagueKeys = new Set(
+        existing
+          .map((profile) => profile.league_key)
+          .filter((key): key is string => Boolean(key)),
       );
 
-    const currentLeague =
-      currentLeagueRows[0];
+      // Preserve the old special league profile and ALL of its tracking.
+      // Only assign it a GGG league key when that choice is unambiguous.
+      const legacy = existing.find(
+        (profile) =>
+          profile.id === CURRENT_LEAGUE_PROFILE_ID &&
+          !profile.league_key,
+      );
 
-    if (!currentLeague) {
+      if (legacy) {
+        const exactMatch = detectedLeagues.find(
+          (league) => league.id === legacy.name,
+        );
+        const adopt =
+          exactMatch ??
+          (detectedLeagues.length === 1 ? detectedLeagues[0] : null);
+
+        if (adopt && !representedLeagueKeys.has(adopt.id)) {
+          await db.execute(
+            `
+              UPDATE collection_profiles
+              SET name = ?, league_key = ?
+              WHERE id = ? AND league_key IS NULL
+            `,
+            [adopt.id, adopt.id, legacy.id],
+          );
+
+          representedLeagueKeys.add(adopt.id);
+          nextProfiles = nextProfiles.map((profile) =>
+            profile.id === legacy.id
+              ? { ...profile, name: adopt.id }
+              : profile,
+          );
+        }
+      }
+
+      // Discover new league/event profiles without moving, merging, or
+      // deleting a single existing collection entry.
+      const knownIds = new Set(existing.map((profile) => profile.id));
+      let nextSortOrder = Math.max(
+        10,
+        ...existing.map((profile) => profile.sort_order + 1),
+      );
+
+      for (const league of detectedLeagues) {
+        if (representedLeagueKeys.has(league.id)) {
+          continue;
+        }
+
+        const baseId = `league:${encodeURIComponent(league.id)}`;
+        let newId = baseId;
+        let suffix = 1;
+
+        while (knownIds.has(newId)) {
+          newId = `${baseId}:${suffix}`;
+          suffix += 1;
+        }
+
+        // Also avoid colliding with archived profiles not shown above.
+        const idRows = await db.select<{ id: string }[]>(
+          `SELECT id FROM collection_profiles WHERE id = ?`,
+          [newId],
+        );
+
+        if (idRows.length > 0) {
+          newId = `${baseId}:${Date.now()}:${nextSortOrder}`;
+        }
+
+        await db.execute(
+          `
+            INSERT INTO collection_profiles (
+              id, name, kind, league_key, is_archived, sort_order
+            ) VALUES (?, ?, 'challenge', ?, 0, ?)
+          `,
+          [newId, league.id, league.id, String(nextSortOrder)],
+        );
+
+        // Already-known uniques are Missing in a fresh league. New wiki
+        // discoveries can still show up as Unreviewed later.
+        await db.execute(
+          `
+            INSERT OR IGNORE INTO profile_collection_review (
+              profile_id, unique_id, reviewed
+            )
+            SELECT ?, id, 1
+            FROM unique_variants
+            WHERE source IN ('poewiki', 'built-in-special')
+          `,
+          [newId],
+        );
+
+        knownIds.add(newId);
+        representedLeagueKeys.add(league.id);
+        nextProfiles.push({
+          id: newId,
+          name: league.id,
+          kind: "challenge",
+          isArchived: false,
+        });
+        nextSortOrder += 1;
+      }
+
+      // Announce an ended league, but never migrate any data automatically.
+      // Newly discovered leagues remain fully independent of the old one.
+      const endedProfiles = existing.filter(
+        (profile) =>
+          Boolean(profile.league_key) &&
+          !activeLeagueKeys.has(profile.league_key!),
+      );
+      const ended =
+        endedProfiles.find((profile) => profile.id === activeProfileId) ??
+        endedProfiles[0];
+      if (ended) {
+        try {
+          const preview = await buildLeagueRolloverPreview(
+            db,
+            ended.id,
+            "Standard",
+          );
+          setRolloverPreview(preview);
+          setRolloverMode("pending");
+          setRolloverChangesExpanded(false);
+          setRolloverPreviewOpen(true);
+        } catch (previewError) {
+          console.warn("Could not prepare ended-league preview:", previewError);
+        }
+      }
+
+      return nextProfiles.sort((left, right) => {
+        if (left.kind === "standard") return -1;
+        if (right.kind === "standard") return 1;
+        return left.name.localeCompare(right.name);
+      });
+    } catch (error) {
+      // Offline startup and transient GGG API errors must never prevent
+      // an existing local collection from loading normally.
+      console.warn("Could not discover PoE leagues:", error);
       return profiles;
     }
+  }
 
-    /*
-     * Existing installations currently have league_key = NULL
-     * because league detection did not exist yet.
-     *
-     * On the first detection we adopt the live league WITHOUT
-     * clearing or rolling anything over.
-     */
-    if (!currentLeague.league_key) {
-      await db.execute(
-        `
-          UPDATE collection_profiles
-          SET
-            name = ?,
-            league_key = ?
-          WHERE id = ?
-        `,
-        [
-          detectedLeague.id,
-          detectedLeague.id,
-          CURRENT_LEAGUE_PROFILE_ID,
-        ],
-      );
-
-      return profiles.map((profile) =>
-        profile.id ===
-        CURRENT_LEAGUE_PROFILE_ID
-          ? {
-              ...profile,
-              name: detectedLeague.id,
-            }
-          : profile,
-      );
+  async function buildLeagueRolloverPreview(
+    db: Database,
+    profileId: string,
+    newLeagueName: string,
+  ): Promise<LeagueRolloverPreview> {
+    const leagueDetails = await db.select<
+      Array<{ name: string; kind: string; is_archived: number }>
+    >(
+      `SELECT name, kind, is_archived FROM collection_profiles WHERE id = ?`,
+      [profileId],
+    );
+    const league = leagueDetails[0];
+    if (!league || league.kind !== "challenge" || league.is_archived === 1) {
+      throw new Error("An active league collection could not be found.");
     }
 
-    /*
-     * A different stored league means a new league has appeared.
-     * DO NOT rollover yet. Phase 2 will handle that safely.
-     */
-    if (
-  currentLeague.league_key !==
-  detectedLeague.id
-) {
-  const preview =
-    await buildLeagueRolloverPreview(
-      db,
-      detectedLeague.id,
-    );
-
-  setRolloverPreview(preview);
-  setRolloverMode("pending");
-  setRolloverChangesExpanded(false);
-  setRolloverPreviewOpen(true);
-}
-
-return profiles;
-  } catch (error) {
-    console.error(
-      "Could not detect current Path of Exile league:",
-      error,
-    );
-
-    // League detection is optional. The local collection
-    // should still start normally while offline.
-    return profiles;
-  }
-}
-
-async function buildLeagueRolloverPreview(
-  db: Database,
-  newLeagueName: string,
-): Promise<LeagueRolloverPreview> {
-  const leagueRows =
-    await db.select<
-      {
-        unique_id: string;
-        flag: string;
-        name: string | null;
-      }[]
+    const leagueRows = await db.select<
+      Array<{ unique_id: string; flag: string; name: string | null }>
     >(
       `
-        SELECT
-          tracking.unique_id,
-          tracking.flag,
-          variants.name
+        SELECT tracking.unique_id, tracking.flag, variants.name
         FROM profile_unique_tracking tracking
         LEFT JOIN unique_variants variants
           ON variants.id = tracking.unique_id
         WHERE tracking.profile_id = ?
       `,
-      [CURRENT_LEAGUE_PROFILE_ID],
+      [profileId],
     );
-
-  const standardRows =
-    await db.select<
-      {
-        unique_id: string;
-        flag: string;
-      }[]
+    const standardRows = await db.select<
+      Array<{ unique_id: string; flag: string }>
     >(
-      `
-        SELECT unique_id, flag
-        FROM profile_unique_tracking
-        WHERE profile_id = ?
-      `,
+      `SELECT unique_id, flag FROM profile_unique_tracking WHERE profile_id = ?`,
       [STANDARD_PROFILE_ID],
     );
-
-  const currentLeagueRows =
-    await db.select<
-      {
-        name: string;
-      }[]
-    >(
-      `
-        SELECT name
-        FROM collection_profiles
-        WHERE id = ?
-      `,
-      [CURRENT_LEAGUE_PROFILE_ID],
+    const standardFlags = new Set(
+      standardRows.map((row) => `${row.unique_id}|||${row.flag}`),
     );
+    const changesByUnique = new Map<string, LeagueRolloverChange>();
+    const flagCounts: Record<TrackingFlag, number> = {
+      owned: 0,
+      wearing: 0,
+      foil: 0,
+      foulborn: 0,
+      vestigial: 0,
+    };
 
-  const standardFlags =
-    new Set(
-      standardRows.map(
-        (row) =>
-          `${row.unique_id}|||${row.flag}`,
-      ),
-    );
-
-  const changesByUnique =
-    new Map<
-      string,
-      LeagueRolloverChange
-    >();
-
-  const flagCounts: Record<
-    TrackingFlag,
-    number
-  > = {
-    owned: 0,
-    wearing: 0,
-    foil: 0,
-    foulborn: 0,
-    vestigial: 0,
-  };
-
-  for (const row of leagueRows) {
-    if (!isTrackingFlag(row.flag)) {
-      continue;
-    }
-
-    const alreadyInStandard =
-      standardFlags.has(
-        `${row.unique_id}|||${row.flag}`,
-      );
-
-    if (alreadyInStandard) {
-      continue;
-    }
-
-    flagCounts[row.flag] += 1;
-
-    const existing =
-      changesByUnique.get(
-        row.unique_id,
-      );
-
-    if (existing) {
-      if (
-        !existing.addedFlags.includes(
-          row.flag,
-        )
-      ) {
-        existing.addedFlags.push(
-          row.flag,
-        );
+    for (const row of leagueRows) {
+      if (!isTrackingFlag(row.flag)) continue;
+      if (standardFlags.has(`${row.unique_id}|||${row.flag}`)) continue;
+      flagCounts[row.flag] += 1;
+      const existing = changesByUnique.get(row.unique_id);
+      if (existing) {
+        if (!existing.addedFlags.includes(row.flag)) {
+          existing.addedFlags.push(row.flag);
+        }
+      } else {
+        changesByUnique.set(row.unique_id, {
+          uniqueId: row.unique_id,
+          name: row.name ?? row.unique_id,
+          addedFlags: [row.flag],
+        });
       }
+    }
+    const changes = [...changesByUnique.values()].sort(
+      (left, right) => left.name.localeCompare(right.name),
+    );
+    return {
+      profileId,
+      oldLeagueName: league.name,
+      newLeagueName,
+      changedUniques: changes.length,
+      flagCounts,
+      changes,
+    };
+  }
 
-      continue;
+  async function executeLeagueRollover(
+    db: Database,
+    profileId: string,
+    commitChanges: boolean,
+  ): Promise<LeagueRolloverPreview> {
+    const preview = await buildLeagueRolloverPreview(
+      db,
+      profileId,
+      "Standard",
+    );
+    const leagueRows = await db.select<
+      Array<{ name: string; league_key: string | null; kind: string }>
+    >(
+      `SELECT name, league_key, kind FROM collection_profiles WHERE id = ?`,
+      [profileId],
+    );
+    const league = leagueRows[0];
+    if (!league || league.kind !== "challenge") {
+      throw new Error("The league to archive could not be found.");
     }
 
-    changesByUnique.set(
-      row.unique_id,
-      {
-        uniqueId: row.unique_id,
-        name:
-          row.name ??
-          row.unique_id,
-        addedFlags: [row.flag],
-      },
-    );
-  }
-
-  const changes =
-    Array.from(
-      changesByUnique.values(),
-    ).sort((a, b) =>
-      a.name.localeCompare(b.name),
-    );
-
-  return {
-    oldLeagueName:
-      currentLeagueRows[0]?.name ??
-      "Current League",
-    newLeagueName,
-    changedUniques:
-      changes.length,
-    flagCounts,
-    changes,
-  };
-}
-
-async function executeLeagueRollover(
-  db: Database,
-  newLeagueName: string,
-  commitChanges: boolean,
-): Promise<LeagueRolloverPreview> {
-  const preview =
-    await buildLeagueRolloverPreview(
-      db,
-      newLeagueName,
-    );
-
-  const currentLeagueRows =
-    await db.select<
-      {
-        name: string;
-        league_key: string | null;
-      }[]
-    >(
-      `
-        SELECT name, league_key
-        FROM collection_profiles
-        WHERE id = ?
-      `,
-      [CURRENT_LEAGUE_PROFILE_ID],
-    );
-
-  const currentLeague =
-    currentLeagueRows[0];
-
-  if (!currentLeague) {
-    throw new Error(
-      "The current league profile could not be found.",
-    );
-  }
-
-  const oldLeagueKey =
-    currentLeague.league_key ??
-    currentLeague.name;
-
-  const archiveSlug =
-    currentLeague.name
-      .normalize("NFKD")
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "");
-
-  const timestamp = Date.now();
-
-  const archivedProfileId =
-    `archived:${archiveSlug || "league"}:${timestamp}`;
-
-  const rolloverId =
-    `rollover:${timestamp}`;
-
-  const statements:
-    SqliteTransactionStatement[] = [
-      {
-        sql: `
-          INSERT INTO collection_profiles (
-            id,
-            name,
-            kind,
-            league_key,
-            is_archived,
-            sort_order
-          )
-          VALUES (?, ?, 'challenge', ?, 1, 100)
-        `,
-        params: [
-          archivedProfileId,
-          currentLeague.name,
-          oldLeagueKey,
-        ],
-      },
-      {
-        sql: `
-          INSERT INTO profile_unique_tracking (
-            profile_id,
-            unique_id,
-            flag
-          )
-          SELECT
-            ?,
-            unique_id,
-            flag
-          FROM profile_unique_tracking
-          WHERE profile_id = ?
-        `,
-        params: [
-          archivedProfileId,
-          CURRENT_LEAGUE_PROFILE_ID,
-        ],
-      },
-      {
-        sql: `
-          INSERT INTO profile_collection_review (
-            profile_id,
-            unique_id,
-            reviewed
-          )
-          SELECT
-            ?,
-            unique_id,
-            reviewed
-          FROM profile_collection_review
-          WHERE profile_id = ?
-        `,
-        params: [
-          archivedProfileId,
-          CURRENT_LEAGUE_PROFILE_ID,
-        ],
-      },
+    const rolloverId = `rollover:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    const statements: SqliteTransactionStatement[] = [
       {
         sql: `
           INSERT OR IGNORE INTO profile_unique_tracking (
-            profile_id,
-            unique_id,
-            flag
+            profile_id, unique_id, flag
           )
-          SELECT
-            ?,
-            unique_id,
-            flag
+          SELECT ?, unique_id, flag
           FROM profile_unique_tracking
           WHERE profile_id = ?
         `,
-        params: [
-          STANDARD_PROFILE_ID,
-          CURRENT_LEAGUE_PROFILE_ID,
-        ],
+        params: [STANDARD_PROFILE_ID, profileId],
       },
       {
         sql: `
           INSERT OR REPLACE INTO profile_collection_review (
-            profile_id,
-            unique_id,
-            reviewed
+            profile_id, unique_id, reviewed
           )
-          SELECT
-            ?,
-            unique_id,
-            1
+          SELECT ?, unique_id, 1
           FROM profile_unique_tracking
           WHERE profile_id = ?
           GROUP BY unique_id
         `,
-        params: [
-          STANDARD_PROFILE_ID,
-          CURRENT_LEAGUE_PROFILE_ID,
-        ],
+        params: [STANDARD_PROFILE_ID, profileId],
       },
       {
         sql: `
           INSERT INTO league_rollovers (
-            id,
-            archived_profile_id,
-            old_league_key,
-            old_league_name,
-            new_league_key,
-            new_league_name
-          )
-          VALUES (?, ?, ?, ?, ?, ?)
+            id, archived_profile_id, old_league_key,
+            old_league_name, new_league_key, new_league_name
+          ) VALUES (?, ?, ?, ?, ?, ?)
         `,
         params: [
           rolloverId,
-          archivedProfileId,
-          oldLeagueKey,
-          currentLeague.name,
-          newLeagueName,
-          newLeagueName,
+          profileId,
+          league.league_key ?? league.name,
+          league.name,
+          STANDARD_PROFILE_ID,
+          "Standard",
         ],
       },
     ];
 
-  for (const change of preview.changes) {
-    for (const flag of change.addedFlags) {
-      statements.push({
-        sql: `
-          INSERT INTO league_rollover_changes (
-            rollover_id,
-            unique_id,
-            flag
-          )
-          VALUES (?, ?, ?)
-        `,
-        params: [
-          rolloverId,
-          change.uniqueId,
-          flag,
-        ],
-      });
+    for (const change of preview.changes) {
+      for (const flag of change.addedFlags) {
+        statements.push({
+          sql: `
+            INSERT INTO league_rollover_changes (
+              rollover_id, unique_id, flag
+            ) VALUES (?, ?, ?)
+          `,
+          params: [rolloverId, change.uniqueId, flag],
+        });
+      }
     }
-  }
-
-  statements.push(
-    {
-      sql: `
-        DELETE FROM profile_unique_tracking
-        WHERE profile_id = ?
-      `,
-      params: [
-        CURRENT_LEAGUE_PROFILE_ID,
-      ],
-    },
-    {
-      sql: `
-        DELETE FROM profile_collection_review
-        WHERE profile_id = ?
-      `,
-      params: [
-        CURRENT_LEAGUE_PROFILE_ID,
-      ],
-    },
-    {
+    // Preserve all records in the original league. Archiving only hides it
+    // from the active dropdown; other ongoing leagues are never modified.
+    statements.push({
       sql: `
         UPDATE collection_profiles
-        SET
-          name = ?,
-          league_key = ?
-        WHERE id = ?
+        SET is_archived = 1, sort_order = 100
+        WHERE id = ? AND kind = 'challenge' AND is_archived = 0
       `,
-      params: [
-        newLeagueName,
-        newLeagueName,
-        CURRENT_LEAGUE_PROFILE_ID,
-      ],
-    },
-    {
-      sql: `
-        INSERT OR IGNORE INTO profile_collection_review (
-          profile_id,
-          unique_id,
-          reviewed
-        )
-        SELECT
-          ?,
-          id,
-          1
-        FROM unique_variants
-        WHERE source IN (
-          'poewiki',
-          'built-in-special'
-        )
-      `,
-      params: [
-        CURRENT_LEAGUE_PROFILE_ID,
-      ],
-    },
-  );
-
-  await invoke(
-    "execute_sqlite_transaction",
-    {
+      params: [profileId],
+    });
+    await invoke("execute_sqlite_transaction", {
       statements,
       commit: commitChanges,
-    },
-  );
-
-  return preview;
-}
-
-async function previewLeagueRollover() {
-  if (!database) {
-    return;
+    });
+    return preview;
   }
 
-  try {
-    setAppError("");
-
-    const preview =
-      await buildLeagueRolloverPreview(
+  async function previewLeagueRollover() {
+    if (!database) return;
+    try {
+      setAppError("");
+      const profile =
+        collectionProfiles.find(
+          (item) => item.id === activeProfileId && item.kind === "challenge",
+        ) ?? collectionProfiles.find((item) => item.kind === "challenge");
+      if (!profile) {
+        throw new Error("No active league is available to test rollover.");
+      }
+      const preview = await buildLeagueRolloverPreview(
         database,
-        "DEV TEST LEAGUE",
+        profile.id,
+        "Standard",
       );
-
-    setRolloverPreview(preview);
-    setRolloverMode("dev-pending");
-    setRolloverChangesExpanded(false);
-    setRolloverPreviewOpen(true);
-
-    const mainWindow =
-      await WebviewWindow.getByLabel(
-        "main",
-      );
-
-    if (mainWindow) {
-      await mainWindow.show();
-      await mainWindow.setFocus();
+      setRolloverPreview(preview);
+      setRolloverMode("dev-pending");
+      setRolloverChangesExpanded(false);
+      setRolloverPreviewOpen(true);
+      const mainWindow = await WebviewWindow.getByLabel("main");
+      if (mainWindow) {
+        await mainWindow.show();
+        await mainWindow.setFocus();
+      }
+    } catch (error) {
+      console.error("Could not simulate ended league:", error);
+      setAppError(error instanceof Error ? error.message : String(error));
     }
-  } catch (error) {
-    console.error(
-      "Could not simulate new league detection:",
-      error,
-    );
-
-    setAppError(
-      error instanceof Error
-        ? error.message
-        : String(error),
-    );
-  }
-}
-
-async function confirmDevLeagueRollover() {
-  if (
-    !database ||
-    !rolloverPreview ||
-    rolloverApplying
-  ) {
-    return;
   }
 
-  try {
-    setRolloverApplying(true);
-    setAppError("");
-
-    const completed =
-      await executeLeagueRollover(
+  async function confirmDevLeagueRollover() {
+    if (!database || !rolloverPreview || rolloverApplying) return;
+    try {
+      setRolloverApplying(true);
+      setAppError("");
+      const completed = await executeLeagueRollover(
         database,
-        rolloverPreview.newLeagueName,
+        rolloverPreview.profileId,
         false,
       );
-
-    setRolloverPreview(completed);
-    setRolloverMode("dev-complete");
-    setRolloverChangesExpanded(false);
-  } catch (error) {
-    console.error(
-      "Could not test league rollover:",
-      error,
-    );
-
-    setAppError(
-      error instanceof Error
-        ? error.message
-        : String(error),
-    );
-  } finally {
-    setRolloverApplying(false);
-  }
-}
-
-async function confirmLeagueRollover() {
-  if (
-    !database ||
-    !rolloverPreview ||
-    rolloverApplying
-  ) {
-    return;
+      setRolloverPreview(completed);
+      setRolloverMode("dev-complete");
+      setRolloverChangesExpanded(false);
+    } catch (error) {
+      console.error("Could not test league rollover:", error);
+      setAppError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRolloverApplying(false);
+    }
   }
 
-  try {
-    setRolloverApplying(true);
-    setAppError("");
+  async function confirmLeagueRollover() {
+    if (!database || !rolloverPreview || rolloverApplying || snapshotBusy) {
+      return;
+    }
+    try {
+      setRolloverApplying(true);
+      setAppError("");
+      setSnapshotMessage("");
 
-    const completed =
-      await executeLeagueRollover(
+      // The user must save a recovery copy BEFORE the transaction can commit.
+      // Cancelling the save dialog leaves every collection unchanged.
+      const backup = await exportTrackerSnapshot(database);
+      if (!backup) return;
+
+      const completed = await executeLeagueRollover(
         database,
-        rolloverPreview.newLeagueName,
+        rolloverPreview.profileId,
         true,
       );
-
-    setCollectionProfiles(
-      (current) =>
-        current.map((profile) =>
-          profile.id ===
-          CURRENT_LEAGUE_PROFILE_ID
-            ? {
-                ...profile,
-                name:
-                  completed.newLeagueName,
-              }
-            : profile,
-        ),
-    );
-
-    await loadCollectionData(
-      database,
-      activeProfileId,
-    );
-
-    setRolloverPreview(completed);
-    setRolloverMode("complete");
-    setRolloverChangesExpanded(false);
-  } catch (error) {
-    console.error(
-      "Could not complete league rollover:",
-      error,
-    );
-
-    setAppError(
-      error instanceof Error
-        ? error.message
-        : String(error),
-    );
-  } finally {
-    setRolloverApplying(false);
+      const profileState = await initializeCollectionProfiles(database);
+      setCollectionProfiles(profileState.profiles);
+      setActiveProfileId(profileState.activeProfileId);
+      await loadCollectionData(database, profileState.activeProfileId);
+      setSnapshotMessage(`Pre-rollover backup saved as ${backup.fileName}.`);
+      setRolloverPreview(completed);
+      setRolloverMode("complete");
+      setRolloverChangesExpanded(false);
+    } catch (error) {
+      console.error("Could not archive ended league:", error);
+      setAppError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRolloverApplying(false);
+    }
   }
-}
 
 async function loadImportReconciliationSummary(
   db: Database,
@@ -3656,6 +3457,7 @@ const isLegacyOnly =
   async function runCatalogueCheck(
     db: Database,
     force = false,
+    profileId = activeProfileId,
   ) {
     if (catalogueChecking) {
       return;
@@ -3684,7 +3486,7 @@ const isLegacyOnly =
 
       setImportMatchSummary(reconciliation);
 
-      await loadCollectionData(db, activeProfileId);
+      await loadCollectionData(db, profileId);
 
       const checkedTime = new Date(result.checkedAt).toLocaleString();
       setCatalogueCheckMessage(
@@ -4243,6 +4045,11 @@ useEffect(() => {
       (event) => {
         const action = event.payload;
 
+        if (action.kind === "profile") {
+          void handleCollectionProfileChange(action.profileId);
+          return;
+        }
+
         if (action.kind === "missing") {
           void markUniqueMissing(
             action.uniqueId,
@@ -4458,6 +4265,29 @@ setActiveProfileId(
           WHERE key = 'show_legacy_variants'
         `);
 
+        const savedBackupSettings = await db.select<{
+          key: string;
+          value: string;
+        }[]>(`
+          SELECT key, value
+          FROM app_meta
+          WHERE key IN ('restore_backup_mode', 'restore_backup_folder')
+        `);
+
+        for (const setting of savedBackupSettings) {
+          if (setting.key === 'restore_backup_mode') {
+            if (
+              setting.value === 'automatic' ||
+              setting.value === 'ask' ||
+              setting.value === 'off'
+            ) {
+              setBackupMode(setting.value);
+            }
+          } else if (setting.key === 'restore_backup_folder') {
+            setBackupFolder(setting.value);
+          }
+        }
+
         const savedLookupHotkey =
   await db.select<
     { value: string }[]
@@ -4541,7 +4371,7 @@ setActiveProfileId(
         setDatabase(db);
         setDatabaseReady(true);
 
-        void initializeLiveLeague(
+        void initializeLiveLeagues(
   db,
   profileState.profiles,
 ).then((liveProfiles) => {
@@ -4562,7 +4392,7 @@ setActiveProfileId(
 
         // Open immediately with the local database, then check the live
         // catalogue in the background at most once every 24 hours.
-        void runCatalogueCheck(db, false);
+        void runCatalogueCheck(db, false, profileState.activeProfileId);
       } catch (error) {
         console.error(error);
 
@@ -4917,73 +4747,47 @@ async function showOverlayLoading(
     flag: TrackingFlag,
     enabled: boolean,
   ) {
-    if (!database) {
-      return;
-    }
+    if (!database) return;
+    const enabledFlags: TrackingFlag[] = enabled && flag !== "owned"
+      ? ["owned", flag]
+      : [flag];
 
     try {
-      await database.execute(
-        `
-          INSERT OR REPLACE INTO profile_collection_review (
-            profile_id,
-            unique_id,
-            reviewed
-          )
-          VALUES (?, ?, 1)
-        `,
-        [profileId, uniqueId],
-      );
+      await database.execute(`
+        INSERT OR REPLACE INTO profile_collection_review
+          (profile_id, unique_id, reviewed)
+        VALUES (?, ?, 1)
+      `, [profileId, uniqueId]);
 
       if (enabled) {
-        await database.execute(
-          `
-            INSERT OR REPLACE INTO profile_unique_tracking (
-              profile_id,
-              unique_id,
-              flag
-            )
+        for (const enabledFlag of enabledFlags) {
+          await database.execute(`
+            INSERT OR REPLACE INTO profile_unique_tracking
+              (profile_id, unique_id, flag)
             VALUES (?, ?, ?)
-          `,
-          [profileId, uniqueId, flag],
-        );
+          `, [profileId, uniqueId, enabledFlag]);
+        }
       } else {
-        await database.execute(
-          `
-            DELETE FROM profile_unique_tracking
-            WHERE
-              profile_id = ?
-              AND unique_id = ?
-              AND flag = ?
-          `,
-          [profileId, uniqueId, flag],
-        );
+        await database.execute(`
+          DELETE FROM profile_unique_tracking
+          WHERE profile_id = ? AND unique_id = ? AND flag = ?
+        `, [profileId, uniqueId, flag]);
       }
 
       if (profileId === activeProfileId) {
-        setUniques((current) =>
-          current.map((item) =>
-            item.id === uniqueId
-              ? {
-                  ...item,
-                  reviewed: true,
-                  flags: enabled
-                    ? item.flags.includes(flag)
-                      ? item.flags
-                      : [...item.flags, flag]
-                    : item.flags.filter(
-                        (existingFlag) =>
-                          existingFlag !== flag,
-                      ),
-                }
-              : item,
-          ),
-        );
+        setUniques((current) => current.map((item) =>
+          item.id !== uniqueId ? item : {
+            ...item,
+            reviewed: true,
+            flags: enabled
+              ? Array.from(new Set([...item.flags, ...enabledFlags]))
+              : item.flags.filter((existingFlag) => existingFlag !== flag),
+          },
+        ));
       }
     } catch (error) {
-      console.error(
-        "Could not apply overlay status:",
-        error,
-      );
+      console.error("Could not apply overlay status:", error);
+      setAppError(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -5008,41 +4812,43 @@ async function showOverlayLoading(
       return;
     }
 
-    const standardTrackingRows =
-      await database.select<
-        { flag: string }[]
-      >(
-        `
-          SELECT flag
-          FROM profile_unique_tracking
-          WHERE
-            profile_id = ?
-            AND unique_id = ?
-        `,
-        [STANDARD_PROFILE_ID, localEntry.id],
-      );
+    const profileStateRows = await database.select<{
+      id: string;
+      name: string;
+      flag: string | null;
+      reviewed: number;
+    }[]>(`
+      SELECT
+        profiles.id,
+        profiles.name,
+        tracking.flag,
+        COALESCE(review.reviewed, 0) AS reviewed
+      FROM collection_profiles profiles
+      LEFT JOIN profile_unique_tracking tracking
+        ON tracking.profile_id = profiles.id AND tracking.unique_id = ?
+      LEFT JOIN profile_collection_review review
+        ON review.profile_id = profiles.id AND review.unique_id = ?
+      WHERE profiles.is_archived = 0
+      ORDER BY profiles.sort_order ASC, profiles.name ASC
+    `, [localEntry.id, localEntry.id]);
 
-    const standardReviewRows =
-      await database.select<
-        { reviewed: number }[]
-      >(
-        `
-          SELECT reviewed
-          FROM profile_collection_review
-          WHERE
-            profile_id = ?
-            AND unique_id = ?
-        `,
-        [STANDARD_PROFILE_ID, localEntry.id],
-      );
-
-    const standardFlags =
-      standardTrackingRows
-        .map((row) => row.flag)
-        .filter(isTrackingFlag);
-
-    const standardReviewed =
-      standardReviewRows[0]?.reviewed === 1;
+    const profileStatesById = new Map<string, OverlayProfileState>();
+    for (const row of profileStateRows) {
+      let profileState = profileStatesById.get(row.id);
+      if (!profileState) {
+        profileState = {
+          id: row.id,
+          name: row.name,
+          flags: [],
+          reviewed: row.reviewed === 1,
+        };
+        profileStatesById.set(row.id, profileState);
+      }
+      if (row.flag && isTrackingFlag(row.flag)) {
+        profileState.flags.push(row.flag);
+      }
+    }
+    const profileStates = Array.from(profileStatesById.values());
 
     const payload: OverlayPayload = {
       trackingProfileId: activeProfileId,
@@ -5054,8 +4860,7 @@ async function showOverlayLoading(
       itemType: result.itemType,
       variantLabel: result.variantLabel,
       edition: result.edition,
-      standardFlags,
-      standardReviewed,
+      profileStates,
       trackingFlags: [...localEntry.flags],
       trackingReviewed: localEntry.reviewed,
       editionAvailability:
@@ -5447,81 +5252,49 @@ try {
     uniqueId: string,
     flag: TrackingFlag,
   ) {
-    if (!database) {
-      return;
-    }
-
+    if (!database) return;
     const unique = uniques.find((item) => item.id === uniqueId);
-
-    if (!unique) {
-      return;
-    }
-
+    if (!unique) return;
     const isActive = unique.flags.includes(flag);
+    const enabledFlags: TrackingFlag[] = !isActive && flag !== "owned"
+      ? ["owned", flag]
+      : [flag];
 
     try {
       setAppError("");
-
-      await database.execute(
-        `
-          INSERT OR REPLACE INTO profile_collection_review (
-            profile_id,
-            unique_id,
-            reviewed
-          )
-          VALUES (?, ?, 1)
-        `,
-        [activeProfileId, uniqueId],
-      );
+      await database.execute(`
+        INSERT OR REPLACE INTO profile_collection_review
+          (profile_id, unique_id, reviewed)
+        VALUES (?, ?, 1)
+      `, [activeProfileId, uniqueId]);
 
       if (isActive) {
-        await database.execute(
-          `
-            DELETE FROM profile_unique_tracking
-            WHERE
-              profile_id = ?
-              AND unique_id = ?
-              AND flag = ?
-          `,
-          [activeProfileId, uniqueId, flag],
-        );
+        await database.execute(`
+          DELETE FROM profile_unique_tracking
+          WHERE profile_id = ? AND unique_id = ? AND flag = ?
+        `, [activeProfileId, uniqueId, flag]);
       } else {
-        await database.execute(
-          `
-            INSERT OR REPLACE INTO profile_unique_tracking (
-              profile_id,
-              unique_id,
-              flag
-            )
+        for (const enabledFlag of enabledFlags) {
+          await database.execute(`
+            INSERT OR REPLACE INTO profile_unique_tracking
+              (profile_id, unique_id, flag)
             VALUES (?, ?, ?)
-          `,
-          [activeProfileId, uniqueId, flag],
-        );
+          `, [activeProfileId, uniqueId, enabledFlag]);
+        }
       }
 
-      setUniques((current) =>
-        current.map((item) => {
-          if (item.id !== uniqueId) {
-            return item;
-          }
-
-          return {
-            ...item,
-            reviewed: true,
-            flags: isActive
-              ? item.flags.filter(
-                  (existingFlag) => existingFlag !== flag,
-                )
-              : [...item.flags, flag],
-          };
-        }),
-      );
+      setUniques((current) => current.map((item) =>
+        item.id !== uniqueId ? item : {
+          ...item,
+          reviewed: true,
+          flags: isActive
+            ? item.flags.filter((existingFlag) => existingFlag !== flag)
+            : Array.from(new Set([...item.flags, ...enabledFlags])),
+        },
+      ));
     } catch (error) {
       console.error(error);
-
-      setAppError(
-        error instanceof Error ? error.message : String(error),
-      );
+      setAppError(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -6227,6 +6000,169 @@ try {
     }
   }
 
+  async function handleExportTrackerSnapshot() {
+  if (!database || snapshotBusy) {
+    return;
+  }
+
+  try {
+    setSnapshotBusy(true);
+    setSnapshotMessage("");
+    setAppError("");
+
+    const result = await exportTrackerSnapshot(database);
+
+    if (!result) {
+      return;
+    }
+
+    setSnapshotMessage(
+      `Saved ${result.profileCount} collections to ${result.fileName}.`,
+    );
+  } catch (error) {
+    console.error("Could not export tracker snapshot:", error);
+
+    setAppError(
+      error instanceof Error
+        ? error.message
+        : String(error),
+    );
+  } finally {
+    setSnapshotBusy(false);
+  }
+}
+
+  async function handleChooseTrackerSnapshot() {
+    if (!database || snapshotBusy) return;
+
+    try {
+      setSnapshotBusy(true);
+      setSnapshotRestoreError("");
+      setBackupPromptOpen(false);
+      setAppError("");
+
+      const preview = await chooseTrackerSnapshot();
+      if (preview) setPendingSnapshotRestore(preview);
+    } catch (error) {
+      console.error("Could not preview tracker snapshot:", error);
+      setAppError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSnapshotBusy(false);
+    }
+  }
+
+  async function saveBackupMode(mode: BackupMode) {
+    if (!database) return;
+    try {
+      await database.execute(
+        `INSERT OR REPLACE INTO app_meta (key, value)
+         VALUES ('restore_backup_mode', ?)`,
+        [mode],
+      );
+      setBackupMode(mode);
+      setBackupSettingsMessage("Backup preference saved.");
+      setAppError("");
+    } catch (error) {
+      setAppError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function chooseBackupFolder(): Promise<string | null> {
+    if (!database) throw new Error("The local database is not ready yet.");
+
+    const selected = await open({ directory: true, multiple: false });
+    if (!selected || Array.isArray(selected)) return null;
+
+    await database.execute(
+      `INSERT OR REPLACE INTO app_meta (key, value)
+       VALUES ('restore_backup_folder', ?)`,
+      [selected],
+    );
+    setBackupFolder(selected);
+    setBackupSettingsMessage("Backup folder saved.");
+    return selected;
+  }
+
+  async function handleChooseBackupFolder() {
+    try {
+      setAppError("");
+      await chooseBackupFolder();
+    } catch (error) {
+      setAppError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  // The confirmation always precedes any replacement of collection data.
+  // "automatic" writes a backup without prompting if a folder was chosen;
+  // "ask" presents a separate decision; "off" is an explicit opt-out.
+  async function handleConfirmTrackerSnapshotRestore(
+    backupDecision?: boolean,
+  ) {
+    if (!database || !pendingSnapshotRestore || snapshotBusy) return;
+
+    if (backupMode === "ask" && backupDecision === undefined) {
+      setBackupPromptOpen(true);
+      return;
+    }
+
+    const shouldBackUp = backupDecision ?? backupMode === "automatic";
+
+    try {
+      setSnapshotBusy(true);
+      setSnapshotRestoreError("");
+      setSnapshotMessage("");
+      setAppError("");
+
+      let backupPath = "";
+      if (shouldBackUp) {
+        let folder = backupFolder;
+        if (!folder) {
+          const selected = await chooseBackupFolder();
+          if (!selected) {
+            setSnapshotRestoreError(
+              "Restore cancelled: a backup folder was not selected.",
+            );
+            return;
+          }
+          folder = selected;
+        }
+
+        // If creation fails, restore does NOT run.
+        const backup = await createTrackerBackup(database, folder);
+        backupPath = backup.path;
+      }
+
+      const result = await restoreTrackerSnapshot(
+        database,
+        pendingSnapshotRestore,
+      );
+      const profileState = await initializeCollectionProfiles(database);
+
+      setCollectionProfiles(profileState.profiles);
+      setActiveProfileId(profileState.activeProfileId);
+      await loadCollectionData(database, profileState.activeProfileId);
+      setSourceFile(result.fileName);
+      setPendingSnapshotRestore(null);
+      setBackupPromptOpen(false);
+      setRolloverPreviewOpen(false);
+
+      setSnapshotMessage(
+        `Restored ${result.profileCount} collections from ${result.fileName}.` +
+        (backupPath ? ` Previous tracker backed up to ${backupPath}.` : "") +
+        (result.skippedUnknownUniques > 0
+          ? ` ${result.skippedUnknownUniques} unknown catalogue rows were skipped.`
+          : ""),
+      );
+    } catch (error) {
+      console.error("Could not restore tracker snapshot:", error);
+      setSnapshotRestoreError(
+        error instanceof Error ? error.message : String(error),
+      );
+    } finally {
+      setSnapshotBusy(false);
+    }
+  }
+
   async function handleImport() {
     if (!database) {
       setAppError("The local database is not ready yet.");
@@ -6388,6 +6324,34 @@ try {
     }
   }
 
+  async function minimizeMainWindow() {
+    try {
+      const mainWindow = await WebviewWindow.getByLabel("main");
+      if (mainWindow) {
+        await mainWindow.minimize();
+      }
+      setClosePromptOpen(false);
+    } catch (error) {
+      setAppError(
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
+  async function hideMainWindowToTray() {
+    try {
+      const mainWindow = await WebviewWindow.getByLabel("main");
+      if (mainWindow) {
+        await mainWindow.hide();
+      }
+      setClosePromptOpen(false);
+    } catch (error) {
+      setAppError(
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
   return (
   <main className="app">
     <AppUpdater />
@@ -6449,7 +6413,7 @@ try {
         setRolloverPreviewOpen(true);
       }}
     >
-      ⚠ {rolloverPreview.newLeagueName} available
+      ⚠ {rolloverPreview.oldLeagueName} may have ended
       {" — "}
       Review
     </button>
@@ -6475,18 +6439,46 @@ try {
             )}
         </div>
 
-        <button
-          className="import-button"
-          type="button"
-          onClick={handleImport}
-          disabled={isImporting || !databaseReady}
-        >
-          {isImporting
-            ? "Importing..."
-            : uniques.length > 0
-              ? "Import Another Collection"
-              : "Import Existing Collection"}
-        </button>
+          <div className="collection-actions">
+  <div className="collection-action-buttons">
+    <button
+      className="import-button"
+      type="button"
+      onClick={handleImport}
+      disabled={isImporting || snapshotBusy || !databaseReady}
+    >
+      {isImporting
+        ? "Importing..."
+        : uniques.length > 0
+          ? "Import Another Collection"
+          : "Import Existing Collection"}
+    </button>
+
+    <button
+      className="snapshot-button"
+      type="button"
+      onClick={() => void handleExportTrackerSnapshot()}
+      disabled={snapshotBusy || !databaseReady}
+    >
+      {snapshotBusy ? "Working..." : "Export Snapshot"}
+    </button>
+
+    <button
+      className="snapshot-button"
+      type="button"
+      onClick={() => void handleChooseTrackerSnapshot()}
+      disabled={snapshotBusy || !databaseReady}
+    >
+      Restore Snapshot
+    </button>
+  </div>
+
+  {snapshotMessage && (
+    <span className="snapshot-message">
+      {snapshotMessage}
+    </span>
+  )}
+</div>
       </section>
 
       {appError && (
@@ -6606,6 +6598,24 @@ try {
                 ))}
               </select>
             </div>
+
+            <button
+              type="button"
+              className="catalogue-update-secondary"
+              style={{ alignSelf: "flex-end", whiteSpace: "nowrap" }}
+              disabled={
+                searchTerm === "" &&
+                statusFilter === "all" &&
+                typeFilter === "All"
+              }
+              onClick={() => {
+                setSearchTerm("");
+                setStatusFilter("all");
+                setTypeFilter("All");
+              }}
+            >
+              Clear Filters
+            </button>
           </section>
 
           <section className="collection-list">
@@ -6768,8 +6778,8 @@ editionSources={
               : rolloverMode === "dev-complete"
                 ? "DEV ROLLOVER TEST PASSED"
                 : rolloverMode === "pending"
-                  ? "NEW LEAGUE AVAILABLE"
-                  : "LEAGUE ROLLOVER COMPLETE"}
+                  ? "LEAGUE MAY HAVE ENDED"
+                  : "LEAGUE ARCHIVED"}
           </span>
 
           <h2>
@@ -6780,12 +6790,12 @@ editionSources={
 
           <p>
             {rolloverMode === "dev-pending"
-              ? "Development simulation. This behaves like a real new-league prompt, but starting the test league will roll every database change back."
+              ? "Development simulation. The merge runs inside a transaction and is rolled back; no data will change."
               : rolloverMode === "dev-complete"
-                ? "The complete rollover transaction succeeded and was rolled back. No collection data was changed."
+                ? "The rollover test was rolled back successfully. No collection data changed."
                 : rolloverMode === "pending"
-                  ? `${rolloverPreview.oldLeagueName} has ended. Your collection can be archived and merged into Standard before starting ${rolloverPreview.newLeagueName}.`
-                  : `${rolloverPreview.oldLeagueName} has been archived and merged into Standard. ${rolloverPreview.newLeagueName} is ready as a fresh collection.`}
+                  ? `GGG's current trade league list no longer includes ${rolloverPreview.oldLeagueName}. You can keep tracking it by choosing Not Now, or save a recovery snapshot and archive it. Archiving merges its owned statuses into Standard without deleting its saved history or touching other active leagues.`
+                  : `${rolloverPreview.oldLeagueName} was archived and its owned statuses merged into Standard. Other active leagues were untouched.`}
           </p>
         </div>
 
@@ -6898,8 +6908,8 @@ editionSources={
               }
             >
               {rolloverApplying
-                ? "Starting New League..."
-                : `Start ${rolloverPreview.newLeagueName}`}
+                ? "Saving Backup / Archiving..."
+                : "Back Up & Archive to Standard"}
             </button>
           ) : rolloverMode ===
             "dev-pending" ? (
@@ -6913,7 +6923,7 @@ editionSources={
             >
               {rolloverApplying
                 ? "Testing Rollover..."
-                : `Test Start ${rolloverPreview.newLeagueName}`}
+                : "Test Archive to Standard"}
             </button>
           ) : (
             <button
@@ -7377,6 +7387,136 @@ editionSources={
   />
 )}
 
+      {pendingSnapshotRestore && (
+        <div className="catalogue-update-overlay">
+          <section className="catalogue-update-modal">
+            <div className="catalogue-update-heading">
+              <span className="catalogue-update-kicker">SNAPSHOT RESTORE</span>
+              <h2>Restore your collections?</h2>
+              <p>
+                File: <strong>{pendingSnapshotRestore.fileName}</strong>
+              </p>
+              <p>
+                This will replace all saved league profiles, tracking statuses,
+                and reviewed flags with the snapshot data. The current catalogue
+                itself will stay in place.
+              </p>
+              <p>
+                {backupMode === "automatic"
+                  ? "A backup of your current collection will be created before restoring. Choose a folder if prompted. Restore will stop if the backup fails."
+                  : backupMode === "ask"
+                    ? "You will be asked whether to back up your current collection before restoring."
+                    : "WARNING: Automatic backups are disabled. Restoring will replace your current collection WITHOUT a backup."}
+              </p>
+              <p>
+                {pendingSnapshotRestore.profiles.length} collections ·{" "}
+                {pendingSnapshotRestore.collectionRows.toLocaleString()} saved
+                catalogue rows
+              </p>
+              <div style={{ maxHeight: 120, overflowY: "auto" }}>
+                {pendingSnapshotRestore.profiles.map((profile) => (
+                  <p key={profile.id} className="catalogue-update-note">
+                    {profile.name}{profile.isArchived ? " (archived)" : ""}
+                  </p>
+                ))}
+              </div>
+              {snapshotRestoreError && (
+                <p style={{ color: "#e5b3aa" }}>{snapshotRestoreError}</p>
+              )}
+            </div>
+            <div className="catalogue-update-actions">
+              <button
+                type="button"
+                className="catalogue-update-secondary"
+                disabled={snapshotBusy}
+                onClick={() => {
+                  setPendingSnapshotRestore(null);
+                  setSnapshotRestoreError("");
+                  setBackupPromptOpen(false);
+                }}
+              >
+                Cancel
+              </button>
+              {backupMode === "ask" && backupPromptOpen ? (
+                <>
+                  <button
+                    type="button"
+                    className="catalogue-update-secondary"
+                    disabled={snapshotBusy}
+                    onClick={() => void handleConfirmTrackerSnapshotRestore(false)}
+                  >
+                    Restore Without Backup
+                  </button>
+                  <button
+                    type="button"
+                    className="catalogue-update-primary"
+                    disabled={snapshotBusy}
+                    onClick={() => void handleConfirmTrackerSnapshotRestore(true)}
+                  >
+                    Back Up & Restore
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  className="catalogue-update-primary"
+                  disabled={snapshotBusy}
+                  onClick={() => void handleConfirmTrackerSnapshotRestore()}
+                >
+                  {snapshotBusy
+                    ? "Working..."
+                    : backupMode === "automatic"
+                      ? "Back Up & Restore"
+                      : backupMode === "ask"
+                        ? "Choose Backup Option"
+                        : "Restore Without Backup"}
+                </button>
+              )}
+            </div>
+          </section>
+        </div>
+      )}
+
+      {closePromptOpen && (
+        <div className="catalogue-update-overlay">
+          <section className="catalogue-update-modal">
+            <div className="catalogue-update-heading">
+              <span className="catalogue-update-kicker">CLOSE TRACKER</span>
+              <h2>What should the tracker do?</h2>
+              <p>
+                Minimize keeps it on your taskbar. Close to Tray hides the
+                window but keeps the in-game lookup hotkey running. To quit
+                completely, use Exit Application from the tray icon.
+              </p>
+            </div>
+
+            <div className="catalogue-update-actions">
+              <button
+                type="button"
+                className="catalogue-update-secondary"
+                onClick={() => setClosePromptOpen(false)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="catalogue-update-secondary"
+                onClick={() => void minimizeMainWindow()}
+              >
+                Minimize
+              </button>
+              <button
+                type="button"
+                className="catalogue-update-primary"
+                onClick={() => void hideMainWindowToTray()}
+              >
+                Close to Tray
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
       {settingsOpen && (
         <div
           className="settings-overlay"
@@ -7390,6 +7530,11 @@ editionSources={
               <div>
                 <h2>Settings</h2>
                 <p>Customize how PoE Collector looks and behaves.</p>
+                {appVersion && (
+                  <p style={{ fontSize: 10, opacity: 0.6 }}>
+                    Version: {appVersion}
+                  </p>
+                )}
               </div>
 
               <button
@@ -7399,6 +7544,46 @@ editionSources={
               >
                 ×
               </button>
+            </div>
+
+            <div className="settings-section">
+              <h3>Backup & Restore</h3>
+              <p style={{ color: "#a79d8e", fontSize: 12 }}>
+                These preferences apply when you restore a tracker snapshot.
+                Normal collection edits do not create separate Excel backups.
+              </p>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 12 }}>
+                <label htmlFor="backup-mode">Before restoring a snapshot</label>
+                <select
+                  id="backup-mode"
+                  value={backupMode}
+                  disabled={!databaseReady || snapshotBusy}
+                  onChange={(event) => {
+                    void saveBackupMode(event.target.value as BackupMode);
+                  }}
+                >
+                  <option value="automatic">Back up automatically</option>
+                  <option value="ask">Ask me every time</option>
+                  <option value="off">Do not back up</option>
+                </select>
+                <button
+                  type="button"
+                  className="catalogue-update-secondary"
+                  style={{ alignSelf: "flex-start" }}
+                  disabled={!databaseReady || snapshotBusy}
+                  onClick={() => void handleChooseBackupFolder()}
+                >
+                  Choose Backup Folder
+                </button>
+                <span style={{ fontSize: 11, color: "#a79d8e", overflowWrap: "anywhere" }}>
+                  {backupFolder ? `Backup folder: ${backupFolder}` : "No backup folder selected"}
+                </span>
+                {backupSettingsMessage && (
+                  <span style={{ fontSize: 11, color: "#a79d8e" }}>
+                    {backupSettingsMessage}
+                  </span>
+                )}
+              </div>
             </div>
 
             <div className="settings-section">
