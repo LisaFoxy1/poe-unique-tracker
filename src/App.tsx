@@ -404,6 +404,50 @@ function latestReleaseLine(values: Array<string | null>) {
   return best?.label ?? null;
 }
 
+
+const ITEM_TYPE_ORDER = [
+  "Flask",
+  "Amulet",
+  "Ring",
+  "Claw",
+  "Dagger",
+  "Wand",
+  "Sword",
+  "Axe",
+  "Mace",
+  "Bow",
+  "Staff",
+  "Quiver",
+  "Belt",
+  "Gloves",
+  "Boots",
+  "Body Armour",
+  "Helmet",
+  "Shield",
+  "Map",
+  "Jewel",
+  "Contract",
+  "Tincture",
+];
+
+function compareItemTypes(left: string, right: string) {
+  const leftIndex = ITEM_TYPE_ORDER.indexOf(left);
+  const rightIndex = ITEM_TYPE_ORDER.indexOf(right);
+
+  const leftOrder =
+    leftIndex === -1 ? ITEM_TYPE_ORDER.length : leftIndex;
+
+  const rightOrder =
+    rightIndex === -1 ? ITEM_TYPE_ORDER.length : rightIndex;
+
+  return (
+    leftOrder - rightOrder ||
+    left.localeCompare(right)
+  );
+}
+
+
+
 const DEFAULT_STATUS_COLORS: StatusColors = {
   missing: "#d76868",
   owned: "#79ba68",
@@ -2466,9 +2510,29 @@ function MainApp() {
   const [collectionProfiles, setCollectionProfiles] = useState<
     CollectionProfile[]
   >([]);
-  const [activeProfileId, setActiveProfileId] = useState(
+  
+  const [activeProfileId, setActiveProfileIdState] = useState(
     STANDARD_PROFILE_ID,
   );
+
+  const activeProfileIdRef = useRef(STANDARD_PROFILE_ID);
+  const collectionLoadIdRef = useRef(0);
+  const [loadedCollectionProfileId, setLoadedCollectionProfileId] =
+  useState<string | null>(null);
+
+  
+function setActiveProfileId(profileId: string) {
+  if (activeProfileIdRef.current !== profileId) {
+    // Clear the previous collection while the new one loads.
+    setUniques([]);
+    setLoadedCollectionProfileId(null);
+  }
+
+  activeProfileIdRef.current = profileId;
+  setActiveProfileIdState(profileId);
+}
+
+
   const hotkeyLookupRef = useRef<
     () => Promise<void>
   >(async () => {});
@@ -2584,6 +2648,9 @@ const [
   const [rolloverPreview, setRolloverPreview] =
   useState<LeagueRolloverPreview | null>(null);
 
+    const completedRolloverQueueRef =
+    useRef<LeagueRolloverPreview[]>([]);
+
 const [rolloverPreviewOpen, setRolloverPreviewOpen] =
   useState(false);
 
@@ -2630,10 +2697,12 @@ const [
     [collectionProfiles, activeProfileId],
   );
 
-  async function initializeLiveLeagues(
+    async function initializeLiveLeagues(
     db: Database,
     profiles: CollectionProfile[],
   ): Promise<CollectionProfile[]> {
+    const newLeagueNames: string[] = [];
+
     try {
       const {
         activeLeagues: detectedLeagues,
@@ -2746,7 +2815,7 @@ const [
       );
 
 
-      const newLeagueNames: string[] = [];
+      
 
       for (const league of detectedLeagues) {
         if (representedLeagueKeys.has(league.id)) {
@@ -2812,13 +2881,6 @@ const [
       }
 
 
-      // Announce newly created league collections.
-      if (newLeagueNames.length > 0) {
-        setNewLeagueNotice(
-          newLeagueNames.join(", "),
-        );
-      }
-
 
       
       // Find saved leagues that GGG no longer lists as active.
@@ -2826,17 +2888,66 @@ const [
       
       
       
+      
+      // One-time migration for collections created before
+      // the 3.30 official league tracking system.
+      const legacyMigrationState = await db.select<
+        { value: string }[]
+      >(
+        `
+          SELECT value
+          FROM app_meta
+          WHERE key = 'legacy_league_migration_330'
+        `,
+      );
+
+      const legacyMigrationPending =
+        legacyMigrationState.length === 0;
+
+      const legacyMigrationProfiles = legacyMigrationPending
+        ? existing.filter(
+            (profile) =>
+              profile.name !== "Covens of Umbra" &&
+              profile.league_key !== "Covens of Umbra" &&
+              !activeLeagueKeys.has(
+                profile.league_key ?? profile.name,
+              ),
+          )
+        : [];
+
+      const legacyMigrationProfileIds = new Set(
+        legacyMigrationProfiles.map((profile) => profile.id),
+      );
+
+      async function markLegacyLeagueMigrationComplete() {
+        if (!legacyMigrationPending) {
+          return;
+        }
+
+        await db.execute(
+          `
+            INSERT OR REPLACE INTO app_meta (key, value)
+            VALUES ('legacy_league_migration_330', 'yes')
+          `,
+        );
+      }
+
+      // Normal automatic rollover detection for verified
+      // official leagues, excluding our one-time migration.
       const potentiallyEndedProfiles = existing.filter(
         (profile) =>
           profile.league_key !== null &&
+          !legacyMigrationProfileIds.has(profile.id) &&
           verifiedLeagueKeys.has(profile.league_key) &&
           !activeLeagueKeys.has(profile.league_key),
       );
+
 
       // Double-check with GGG's trade API before archiving.
       // An incomplete main-league response must not cause
       // an active collection to be merged into Standard.
       let endedProfiles = potentiallyEndedProfiles;
+
 
       if (potentiallyEndedProfiles.length > 0) {
         const tradeResponse = await fetch(
@@ -2883,6 +2994,13 @@ const [
       }
 
 
+      // Include the one-time migration alongside normal
+      // automatic league rollovers.
+      endedProfiles = [
+        ...legacyMigrationProfiles,
+        ...endedProfiles,
+      ];
+
       if (endedProfiles.length > 0) {
         try {
           // Save a backup automatically, without asking
@@ -2907,6 +3025,10 @@ const [
             completedRollovers.push(completed);
           }
 
+                    // Only mark the migration complete after every
+          // required rollover has successfully committed.
+          await markLegacyLeagueMigrationComplete();
+
           // Refresh profiles and collection data now that
           // the old league collections are archived.
           const refreshed = await initializeCollectionProfiles(db);
@@ -2922,11 +3044,17 @@ const [
             `Automatic rollover backup saved: ${backup.fileName}`,
           );
 
-          // Display the completed rollover notification.
+          
+          // Display the first completed rollover and
+          // queue the remaining notifications.
+          completedRolloverQueueRef.current =
+            completedRollovers.slice(1);
+
           setRolloverPreview(completedRollovers[0]);
           setRolloverMode("complete");
           setRolloverChangesExpanded(false);
           setRolloverPreviewOpen(true);
+
 
           return refreshed.profiles;
         } catch (error) {
@@ -2956,18 +3084,30 @@ const [
         }
       }
 
+            // A fresh installation may have no old collections
+      // to migrate. Mark the migration complete anyway.
+      await markLegacyLeagueMigrationComplete();
+
       return nextProfiles.sort((left, right) => {
         if (left.kind === "standard") return -1;
         if (right.kind === "standard") return 1;
         return left.name.localeCompare(right.name);
       });
+    
     } catch (error) {
       // Offline startup and transient GGG API errors must never prevent
       // an existing local collection from loading normally.
       console.warn("Could not discover PoE leagues:", error);
       return profiles;
+    } finally {
+      // Announce new leagues only after league discovery
+      // and automatic rollovers have finished.
+      if (newLeagueNames.length > 0) {
+        setNewLeagueNotice(newLeagueNames.join(", "));
+      }
     }
   }
+
 
   async function buildLeagueRolloverPreview(
     db: Database,
@@ -3303,12 +3443,22 @@ async function loadImportReconciliationSummary(
   return summary;
 }
 
+  
   async function loadCollectionData(
     db: Database,
-    profileId = activeProfileId,
+    profileId = activeProfileIdRef.current,
   ) {
+    // Ignore requests for a collection that is no
+    // longer selected.
+    if (profileId !== activeProfileIdRef.current) {
+      return;
+    }
+
+    const loadId = ++collectionLoadIdRef.current;
+
     const canonicalReady =
       await isCanonicalCatalogueReady(db);
+
 
     const catalogueItems = await db.select<
       {
@@ -3488,6 +3638,18 @@ editionSourcesByUnique.set(
   existingSources,
 );
 }
+
+
+    // The selected collection may have changed while
+    // the database queries were running.
+    if (
+      profileId !== activeProfileIdRef.current ||
+      loadId !== collectionLoadIdRef.current
+    ) {
+      return;
+    }
+
+    setLoadedCollectionProfileId(profileId);
 
     setUniques(
       catalogueItems.map((item) => {
@@ -3791,10 +3953,9 @@ const isLegacyOnly =
     `);
   }
 
-  async function runCatalogueCheck(
+    async function runCatalogueCheck(
     db: Database,
     force = false,
-    profileId = activeProfileId,
   ) {
     if (catalogueChecking) {
       return;
@@ -3823,7 +3984,7 @@ const isLegacyOnly =
 
       setImportMatchSummary(reconciliation);
 
-      await loadCollectionData(db, profileId);
+      await loadCollectionData(db, activeProfileIdRef.current);
 
       const checkedTime = new Date(result.checkedAt).toLocaleString();
       setCatalogueCheckMessage(
@@ -4417,6 +4578,7 @@ useEffect(() => {
   useEffect(() => {
     async function initializeDatabase() {
       try {
+        
         const db = await Database.load("sqlite:poe-collector.db");
 
         await ensureEditionAvailabilitySchema(
@@ -4705,8 +4867,7 @@ setActiveProfileId(
           setSortMode(savedSortMode[0].value as SortMode);
         }
 
-        setDatabase(db);
-        setDatabaseReady(true);
+        
 
         
         // Finish league detection and any automatic rollover
@@ -4734,6 +4895,9 @@ setActiveProfileId(
           refreshedProfileState.activeProfileId,
         );
 
+        setDatabase(db);
+        setDatabaseReady(true);
+
 
         if (addedSpecialVariants > 0) {
           setCatalogueUpdate({
@@ -4749,11 +4913,7 @@ setActiveProfileId(
 
         // Open immediately with the local database, then check the live
         // catalogue in the background at most once every 24 hours.
-                void runCatalogueCheck(
-          db,
-          false,
-          refreshedProfileState.activeProfileId,
-        );
+        void runCatalogueCheck(db, false);
       } catch (error) {
         console.error(error);
 
@@ -4832,15 +4992,15 @@ setActiveProfileId(
     ];
   }, [visibleUniques, collectionRules, extraTracking]);
 
+  
   const availableTypes = useMemo(() => {
     const types = new Set<string>(
       visibleUniques.map((unique) => unique.itemType),
     );
 
-    return Array.from(types).sort((a, b) =>
-      a.localeCompare(b),
-    );
+    return Array.from(types).sort(compareItemTypes);
   }, [visibleUniques]);
+
 
   const displayedUniques = useMemo(() => {
     const normalizedSearch = searchTerm.trim().toLowerCase();
@@ -4877,13 +5037,18 @@ setActiveProfileId(
     });
 
     return [...filtered].sort((a, b) => {
+      
       if (sortMode === "type") {
-        const typeComparison = a.itemType.localeCompare(b.itemType);
+        const typeComparison = compareItemTypes(
+          a.itemType,
+          b.itemType,
+        );
 
         if (typeComparison !== 0) {
           return typeComparison;
         }
       }
+
 
       const nameComparison = a.name.localeCompare(b.name);
 
@@ -5880,6 +6045,7 @@ try {
       }
     }
 
+
     if (statements.length > 0) {
       await invoke("execute_sqlite_transaction", {
         statements,
@@ -6116,6 +6282,49 @@ try {
           params: [destinationProfileId, ...ids],
         },
       );
+    }
+
+    // Uncertain items need manual review rather than
+    // being automatically considered Owned or Missing.
+    const unreviewedIds = Array.from(protectedIds).filter(
+      (id) => !explicitMissingIds.has(id),
+    );
+
+    for (
+      let index = 0;
+      index < unreviewedIds.length;
+      index += CHUNK_SIZE
+    ) {
+      const ids = unreviewedIds.slice(
+        index,
+        index + CHUNK_SIZE,
+      );
+
+      const placeholders = ids.map(() => "?").join(", ");
+
+      statements.push({
+        sql: `
+          INSERT OR REPLACE INTO profile_collection_review (
+            profile_id,
+            unique_id,
+            reviewed
+          )
+          SELECT ?, id, 0
+          FROM unique_variants
+          WHERE id IN (${placeholders})
+            AND NOT EXISTS (
+              SELECT 1
+              FROM profile_unique_tracking tracking
+              WHERE tracking.profile_id = ?
+                AND tracking.unique_id = unique_variants.id
+            )
+        `,
+        params: [
+          destinationProfileId,
+          ...ids,
+          destinationProfileId,
+        ],
+      });
     }
 
     if (statements.length > 0) {
@@ -6852,15 +7061,37 @@ try {
         </section>
       )}
 
+      
       {uniques.length === 0 ? (
         <section className="empty-state">
-          <h2>No collection loaded yet</h2>
-          <p>
-            Import your existing spreadsheet to start tracking your Path of
-            Exile uniques.
-          </p>
+          {appError ? (
+            <>
+              <h2>Unable to load collection</h2>
+              <p>
+                An error occurred while loading your collection.
+              </p>
+            </>
+          ) : !databaseReady ||
+            loadedCollectionProfileId !== activeProfileId ||
+            catalogueChecking ? (
+            <>
+              <h2>Loading collection...</h2>
+              <p>
+                Preparing your {activeProfile?.name ?? "Path of Exile"} collection.
+              </p>
+            </>
+          ) : (
+            <>
+              <h2>No collection loaded yet</h2>
+              <p>
+                Import your existing spreadsheet to start tracking your Path of
+                Exile uniques.
+              </p>
+            </>
+          )}
         </section>
       ) : (
+
         <>
           <section className="status-summary">
             {trackingCounts.map(({ label, count }) => (
@@ -7294,17 +7525,32 @@ isMissing={isUniqueMissing(unique)}
                 : "Test Archive to Standard"}
             </button>
           ) : (
+            
             <button
               type="button"
               className="catalogue-update-primary"
-              onClick={() =>
-                setRolloverPreviewOpen(false)
-              }
+              onClick={() => {
+                if (rolloverMode === "complete") {
+                  const nextRollover =
+                    completedRolloverQueueRef.current.shift();
+
+                  if (nextRollover) {
+                    setRolloverPreview(nextRollover);
+                    setRolloverChangesExpanded(false);
+                    return;
+                  }
+                }
+
+                setRolloverPreviewOpen(false);
+              }}
             >
               {rolloverMode === "dev-complete"
                 ? "Close Test"
-                : "Continue"}
+                : completedRolloverQueueRef.current.length > 0
+                  ? "Next"
+                  : "Continue"}
             </button>
+
           )}
         </div>
       </section>
@@ -7312,9 +7558,8 @@ isMissing={isUniqueMissing(unique)}
   )}
 
 
-      {newLeagueNotice &&
-        !rolloverPreviewOpen &&
-        !catalogueUpdateOpen && (
+            {newLeagueNotice &&
+        !rolloverPreviewOpen && (
           <div className="catalogue-update-overlay">
             <section className="catalogue-update-modal">
               <div className="catalogue-update-heading">
@@ -7349,18 +7594,26 @@ isMissing={isUniqueMissing(unique)}
 
 ¨¨
 
-      {catalogueUpdateOpen && catalogueUpdate && (
+      
+      {catalogueUpdateOpen &&
+        catalogueUpdate &&
+        !rolloverPreviewOpen &&
+        !newLeagueNotice && (
+
         <div className="catalogue-update-overlay">
           <section className="catalogue-update-modal">
             <div className="catalogue-update-heading">
               <span className="catalogue-update-kicker">
                 CATALOGUE UPDATED
               </span>
-              <h2>{catalogueUpdate.label}</h2>
+              
+              <h2>Unique Catalogue Updated</h2>
               <p>
-                New Path of Exile catalogue data is available.
-                Your existing collection data has been kept.
+                PoE Collector has downloaded the latest unique item
+                information from PoE Wiki. Your existing collection
+                progress has been preserved.
               </p>
+
             </div>
 
             <div className="catalogue-update-stats">
@@ -7382,10 +7635,14 @@ isMissing={isUniqueMissing(unique)}
               </div>
             </div>
 
+            
             <p className="catalogue-update-note">
-              New catalogue entries remain Unreviewed until you tell
-              PoE Collector whether you have them.
+              Newly discovered uniques start as Missing.
+              New variants of existing uniques start as Unreviewed,
+              so you can review them without losing your existing
+              collection progress.
             </p>
+
 
             <div className="catalogue-update-actions">
               <button
@@ -7400,7 +7657,7 @@ isMissing={isUniqueMissing(unique)}
                 className="catalogue-update-primary"
                 onClick={() => acknowledgeCatalogueUpdate(true)}
               >
-                Review New Items
+                Review Unreviewed Items
               </button>
             </div>
           </section>
