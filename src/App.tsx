@@ -117,6 +117,7 @@ type CollectionProfile = {
 
 
 
+
 type PoeTradeLeagueEntry = {
   id: string;
   startAt: string | null;
@@ -127,7 +128,13 @@ type PoeTradeLeagueEntry = {
     id: string;
     current?: boolean;
   };
+  rules?: {
+    id: string;
+    name?: string;
+    description?: string;
+  }[];
 };
+
 
 
 type PoeLeagueDiscovery = {
@@ -1144,16 +1151,23 @@ async function fetchActivePoE1Leagues(): Promise<PoeLeagueDiscovery> {
     }
 
     
-    // Only recognize the main official challenge league.
-    // Hardcore, SSF, private variants, and events must
-    // not create separate collection profiles.
+    
+    // Only recognize the current official PC challenge
+    // league without Hardcore, SSF or Ruthless rules.
+    //
+    // GGG's category ID does not necessarily match the
+    // league ID (for example, Coven vs Covens).
     if (
+      league.realm !== "pc" ||
       isExcludedPoE1League(league.id) ||
       league.event === true ||
-      league.category?.id !== league.id
+      league.category?.current !== true ||
+      !Array.isArray(league.rules) ||
+      league.rules.length !== 0
     ) {
       continue;
     }
+
 
 
     // Unreliable dates must not trigger automatic rollovers.
