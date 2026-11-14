@@ -7006,11 +7006,13 @@ try {
     </button>
   )}
 
+          
           <span className="count">
             {databaseReady
-              ? `${uniques.length.toLocaleString()} uniques loaded`
+              ? `${visibleUniques.length.toLocaleString()} uniques loaded`
               : "Starting local database..."}
           </span>
+
 
           {activeProfile?.kind === "challenge" && (
             <span className="source-file">
@@ -7231,10 +7233,12 @@ try {
             <div className="list-header">
               <div>
                 <h2>Collection</h2>
+                
                 <p>
                   Showing {displayedUniques.length.toLocaleString()} of{" "}
-                  {uniques.length.toLocaleString()} uniques.
+                  {visibleUniques.length.toLocaleString()} uniques.
                 </p>
+
               </div>
 
               <span>
